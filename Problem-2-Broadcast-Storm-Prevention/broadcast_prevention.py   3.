@@ -1,0 +1,218 @@
+from ryu.base import app_manager
+from ryu.controller import ofp_event
+from ryu.controller.handler import (
+    CONFIG_DISPATCHER,
+    MAIN_DISPATCHER,
+    set_ev_cls
+)
+from ryu.ofproto import ofproto_v1_3
+from ryu.lib.packet import packet, ethernet
+from collections import defaultdict, deque
+import time
+
+
+class BroadcastStormPrevention(app_manager.RyuApp):
+
+    OFP_VERSIONS = [ofproto_v1_3.OFP_VERSION]
+
+    def __init__(self, *args, **kwargs):
+        super(BroadcastStormPrevention, self).__init__(
+            *args, **kwargs
+        )
+
+        # MAC learning table: switch -> MAC -> port
+        self.mac_table = defaultdict(dict)
+
+        # Track broadcast packets over a time window
+        self.broadcast_history = defaultdict(deque)
+
+        # Broadcast threshold configuration
+        self.threshold = 10
+        self.time_window = 2
+
+        self.logger.info("Broadcast Storm Prevention started")
+
+    def add_flow(self, datapath, priority, match,
+                 actions, idle_timeout=0):
+
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        instructions = [
+            parser.OFPInstructionActions(
+                ofproto.OFPIT_APPLY_ACTIONS,
+                actions
+            )
+        ]
+
+        flow_mod = parser.OFPFlowMod(
+            datapath=datapath,
+            priority=priority,
+            match=match,
+            instructions=instructions,
+            idle_timeout=idle_timeout
+        )
+
+        datapath.send_msg(flow_mod)
+
+    @set_ev_cls(ofp_event.EventOFPSwitchFeatures,
+                CONFIG_DISPATCHER)
+    def switch_features_handler(self, ev):
+
+        datapath = ev.msg.datapath
+        ofproto = datapath.ofproto
+        parser = datapath.ofproto_parser
+
+        # Send unmatched packets to controller
+        match = parser.OFPMatch()
+        actions = [
+            parser.OFPActionOutput(
+                ofproto.OFPP_CONTROLLER,
+                ofproto.OFPCML_NO_BUFFER
+            )
+        ]
+
+        self.add_flow(datapath, 0, match, actions)
+
+        self.logger.info(
+            "Switch connected: %s", datapath.id
+        )
+
+    @set_ev_cls(ofp_event.EventOFPPacketIn,
+                MAIN_DISPATCHER)
+    def packet_in_handler(self, ev):
+
+        msg = ev.msg
+        datapath = msg.datapath
+        parser = datapath.ofproto_parser
+        ofproto = datapath.ofproto
+
+        in_port = msg.match['in_port']
+
+        pkt = packet.Packet(msg.data)
+        eth = pkt.get_protocol(ethernet.ethernet)
+
+        if eth is None:
+            return
+
+        eth_type = eth.ethertype
+        src_mac = eth.src
+        dst_mac = eth.dst
+        dpid = datapath.id
+
+        self.logger.info(
+            "PacketIn: switch=%s eth.type=%s src=%s dst=%s",
+            dpid, hex(eth_type), src_mac, dst_mac
+        )
+
+        # Learn source MAC address
+        self.mac_table[dpid][src_mac] = in_port
+
+        self.logger.info(
+            "MAC learned: %s -> port %s",
+            src_mac, in_port
+        )
+
+        # Check Ethernet broadcast
+        if dst_mac == 'ff:ff:ff:ff:ff:ff':
+
+            key = (dpid, src_mac, in_port)
+            now = time.monotonic()
+
+            history = self.broadcast_history[key]
+
+            # Remove old timestamps
+            while history and now - history[0] > self.time_window:
+                history.popleft()
+
+            history.append(now)
+
+            # Detect excessive broadcast traffic
+            if len(history) > self.threshold:
+
+                match = parser.OFPMatch(
+                    in_port=in_port,
+                    eth_src=src_mac,
+                    eth_dst=dst_mac
+                )
+
+                # Drop subsequent redundant broadcasts
+                self.add_flow(
+                    datapath,
+                    300,
+                    match,
+                    [],
+                    idle_timeout=10
+                )
+
+                self.logger.warning(
+                    "BROADCAST STORM DETECTED! "
+                    "Dropping broadcasts from %s",
+                    src_mac
+                )
+
+                return
+
+            # Normal broadcast forwarding
+            actions = [
+                parser.OFPActionOutput(
+                    ofproto.OFPP_FLOOD
+                )
+            ]
+
+        else:
+
+            # Look up destination MAC
+            if dst_mac in self.mac_table[dpid]:
+
+                out_port = self.mac_table[dpid][dst_mac]
+
+                if out_port == in_port:
+                    return
+
+                actions = [
+                    parser.OFPActionOutput(out_port)
+                ]
+
+                match = parser.OFPMatch(
+                    in_port=in_port,
+                    eth_src=src_mac,
+                    eth_dst=dst_mac
+                )
+
+                # Install reactive forwarding rule
+                self.add_flow(
+                    datapath,
+                    10,
+                    match,
+                    actions,
+                    idle_timeout=30
+                )
+
+                self.logger.info(
+                    "Reactive FlowMod installed: "
+                    "%s -> %s via port %s",
+                    src_mac, dst_mac, out_port
+                )
+
+            else:
+
+                # Unknown destination: flood
+                actions = [
+                    parser.OFPActionOutput(
+                        ofproto.OFPP_FLOOD
+                    )
+                ]
+
+                self.logger.info(
+                    "Unknown destination: flooding packet"
+                )
+
+        # Send current packet to selected output
+        out = parser.OFPPacketOut(
+            datapath=datapath,
+            buffer_id=ofproto.OFP_NO_BUFFER,
+            in_port=in_port,
+            actions=actions,
+            data=msg.data
+        )
